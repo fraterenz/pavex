@@ -4,7 +4,7 @@ use miette::SourceSpan;
 use std::ops::Deref;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{Expr, ExprCall, ExprMethodCall, Stmt};
+use syn::{Expr, ExprCall, ExprMethodCall, ImplItemFn, ItemFn, Stmt};
 
 use pavex_bp_schema::Location;
 
@@ -30,10 +30,7 @@ use crate::diagnostic::{ParsedSourceFile, ProcMacroSpanExt, convert_proc_macro_s
 /// //             ^^^^^^^^^^^^^^^^^^^^^^^
 /// //             We want a SourceSpan that points at this for constructors
 /// ```
-pub(crate) fn get_f_macro_invocation_span(
-    source: &ParsedSourceFile,
-    location: &Location,
-) -> Option<SourceSpan> {
+pub(crate) fn f_macro_span(source: &ParsedSourceFile, location: &Location) -> Option<SourceSpan> {
     let raw_source = &source.contents;
     let node = find_method_call(location, &source.parsed)?;
     match node {
@@ -426,12 +423,12 @@ enum Call<'a> {
 /// is also the smallest node that contains it—exactly what we are looking for.
 fn find_method_call<'a>(location: &'a Location, file: &'a syn::File) -> Option<Call<'a>> {
     /// A visitor that locates the method call that contains the given `location`.
-    struct CallableLocator<'a> {
+    struct CallLocator<'a> {
         location: &'a Location,
         node: Option<Call<'a>>,
     }
 
-    impl<'a> Visit<'a> for CallableLocator<'a> {
+    impl<'a> Visit<'a> for CallLocator<'a> {
         fn visit_expr_call(&mut self, node: &'a ExprCall) {
             if node.span().contains(self.location) {
                 self.node = Some(Call::FunctionCall(node));
@@ -446,6 +443,57 @@ fn find_method_call<'a>(location: &'a Location, file: &'a syn::File) -> Option<C
             }
         }
 
+        fn visit_stmt(&mut self, node: &'a Stmt) {
+            // This is an optimization—it allows the visitor to skip the entire sub-tree
+            // under a top-level statement that is not relevant to our search.
+            if node.span().contains(self.location) {
+                syn::visit::visit_stmt(self, node)
+            }
+        }
+    }
+
+    let mut locator = CallLocator {
+        location,
+        node: None,
+    };
+    locator.visit_file(file);
+    locator.node
+}
+
+enum CallableDef<'a> {
+    Method(&'a ImplItemFn),
+    Function(&'a ItemFn),
+}
+
+/// Visits the abstract syntax tree of a parsed `syn::File` to find a function definition or method
+/// definition node that contains the given `location`.
+/// It then converts the span associated with the node to a [`SourceSpan`].
+///
+/// # Ambiguity
+///
+/// There may be multiple nodes that match (e.g. a function defined inside another function).
+/// Luckily enough, the visit is pre-order, therefore the latest node that contains `location`
+/// is also the smallest node that contains it—exactly what we are looking for.
+fn find_callable_def<'a>(location: &'a Location, file: &'a syn::File) -> Option<CallableDef<'a>> {
+    /// A visitor that locates the method call that contains the given `location`.
+    struct CallableLocator<'a> {
+        location: &'a Location,
+        node: Option<CallableDef<'a>>,
+    }
+
+    impl<'a> Visit<'a> for CallableLocator<'a> {
+        fn visit_item_fn(&mut self, node: &'a syn::ItemFn) {
+            if node.span().contains(self.location) {
+                self.node = Some(CallableDef::Function(node));
+                syn::visit::visit_item_fn(self, node)
+            }
+        }
+        fn visit_impl_item_fn(&mut self, node: &'a syn::ImplItemFn) {
+            if node.span().contains(self.location) {
+                self.node = Some(CallableDef::Method(node));
+                syn::visit::visit_impl_item_fn(self, node)
+            }
+        }
         fn visit_stmt(&mut self, node: &'a Stmt) {
             // This is an optimization—it allows the visitor to skip the entire sub-tree
             // under a top-level statement that is not relevant to our search.
